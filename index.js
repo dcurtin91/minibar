@@ -24,14 +24,6 @@ const CONFIG = {
 
 // ─── Webflow API helpers ───────────────────────────────────────────────────────
 
-async function fetchSourceItem(itemId) {
-  const url = `https://api.webflow.com/v2/collections/${CONFIG.source.collectionId}/items/${itemId}`;
-  const { data } = await axios.get(url, {
-    headers: { Authorization: `Bearer ${CONFIG.source.token}`, "accept-version": "1.0.0" },
-  });
-  return data;
-}
-
 async function rewriteRichTextImages(html) {
   if (!html) return html;
   const $ = cheerio.load(html, { xmlMode: true });
@@ -75,6 +67,9 @@ async function uploadImageToDestination(imageUrl) {
 async function processFields(fieldData) {
   const processed = {};
   for (const [key, value] of Object.entries(fieldData)) {
+    // Skip internal Webflow fields
+    if (key.startsWith("_")) continue;
+
     if (typeof value === "string" && value.trim().startsWith("<")) {
       console.log(`  Processing rich-text field: ${key}`);
       processed[key] = await rewriteRichTextImages(value);
@@ -87,10 +82,6 @@ async function processFields(fieldData) {
   return processed;
 }
 
-/**
- * Search the destination collection for an existing item by slug.
- * Returns the item if found, or null.
- */
 async function findDestinationItemBySlug(slug) {
   const url = `https://api.webflow.com/v2/collections/${CONFIG.dest.collectionId}/items`;
   const { data } = await axios.get(url, {
@@ -98,13 +89,9 @@ async function findDestinationItemBySlug(slug) {
     headers: { Authorization: `Bearer ${CONFIG.dest.token}`, "accept-version": "1.0.0" },
   });
   const items = data?.items || [];
-  // Double-check slug since Webflow may do partial matching
   return items.find((i) => i.fieldData?.slug === slug) || null;
 }
 
-/**
- * Create a new CMS item on the destination site.
- */
 async function createDestinationItem(fieldData) {
   const url = `https://api.webflow.com/v2/collections/${CONFIG.dest.collectionId}/items`;
   const { data } = await axios.post(
@@ -115,9 +102,6 @@ async function createDestinationItem(fieldData) {
   return data;
 }
 
-/**
- * Update an existing CMS item on the destination site.
- */
 async function updateDestinationItem(itemId, fieldData) {
   const url = `https://api.webflow.com/v2/collections/${CONFIG.dest.collectionId}/items/${itemId}`;
   const { data } = await axios.patch(
@@ -128,9 +112,6 @@ async function updateDestinationItem(itemId, fieldData) {
   return data;
 }
 
-/**
- * Publish all pending CMS changes on the destination site.
- */
 async function publishDestinationSite() {
   const url = `https://api.webflow.com/v2/sites/${CONFIG.dest.siteId}/publish`;
   await axios.post(
@@ -154,46 +135,48 @@ app.post("/webhook/collection-item-published", async (req, res) => {
   }
 
   const payload = req.body;
-  console.log("\n📦 Webhook received:", JSON.stringify(payload, null, 2));
 
-  const itemId =
-    payload?.payload?._id ||
-    payload?.payload?.id ||
-    payload?._id ||
-    payload?.id;
-
-  if (!itemId) {
-    console.error("Could not extract item ID from payload:", payload);
-    return res.status(400).json({ error: "Missing item ID in payload" });
+  // collection_item_published sends an array of items under payload.items
+  const items = payload?.payload?.items;
+  if (!items || items.length === 0) {
+    console.error("No items found in payload:", JSON.stringify(payload));
+    return res.status(400).json({ error: "No items in payload" });
   }
 
   // Respond immediately to avoid Webflow timeout
-  res.status(200).json({ received: true });
+  res.status(200).json({ received: true, count: items.length });
 
-  syncItem(itemId).catch((err) =>
-    console.error("❌ Sync failed for item", itemId, err.message)
-  );
+  // Process each item in the batch
+  for (const item of items) {
+    const itemId = item.id || item._id;
+    const fieldData = item.fieldData;
+
+    if (!itemId || !fieldData) {
+      console.error("Skipping item — missing id or fieldData:", item);
+      continue;
+    }
+
+    syncItem(itemId, fieldData).catch((err) =>
+      console.error(`❌ Sync failed for item ${itemId}:`, err.message)
+    );
+  }
 });
 
 /**
- * Core sync — fetch from source, process fields, upsert by slug, publish.
+ * Core sync — process fields from the webhook payload, upsert by slug, publish.
+ * No extra API call needed — the full fieldData comes in the webhook payload.
  */
-async function syncItem(itemId) {
+async function syncItem(itemId, rawFields) {
   console.log(`\n🔄 Syncing item: ${itemId}`);
-
-  // 1. Fetch the full item from source
-  console.log("  Fetching source item...");
-  const sourceItem = await fetchSourceItem(itemId);
-  const rawFields = sourceItem.fieldData;
   const slug = rawFields?.slug;
   console.log("  Slug:", slug);
-  console.log("  Fields found:", Object.keys(rawFields).join(", "));
+  console.log("  Fields:", Object.keys(rawFields).join(", "));
 
-  // 2. Process fields (rich text + images)
+  // 1. Process fields (rich text + images, skip internal _ fields)
   console.log("  Processing fields...");
   const processedFields = await processFields(rawFields);
 
-  // 3. Upsert by slug — update if exists, create if not
+  // 2. Upsert by slug — update if exists, create if not
   console.log("  Checking for existing item on destination...");
   const existingItem = slug ? await findDestinationItemBySlug(slug) : null;
 
@@ -208,7 +191,7 @@ async function syncItem(itemId) {
     console.log("  ✅ Created item:", resultItem.id);
   }
 
-  // 4. Publish destination site
+  // 3. Publish destination site
   console.log("  Publishing destination site...");
   await publishDestinationSite();
   console.log("  ✅ Site published");
